@@ -1,83 +1,20 @@
 <?php
 
-namespace App\Http\Controllers;
+namespace App\Http\Controllers\Api;
+
+use App\Http\Controllers\Controller;
+use Illuminate\Http\Request;
+use App\Models\Utilizador;
 use App\Models\CodigoMFA;
+use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\Mail;
 use Illuminate\Support\Str;
 use Carbon\Carbon;
-use Illuminate\Http\Request;
-use App\Models\Utilizador;
-use Illuminate\Support\Facades\Auth;
-use Illuminate\Support\Facades\Hash;
-use Illuminate\Support\Facades\Cache;
-
 
 class AuthController extends Controller
 {
-    public function loginForm()
-    {
-        return view('auth.login');
-    }
-
-    public function registerForm()
-    {
-        return view('auth.register');
-    }
-
-    public function login(Request $request)
-    {
-        $request->validate([
-            'email' => 'required|email',
-            'palavra_passe' => 'required|string',
-        ]);
-
-        $email = $request->email;
-        $cacheKey = 'tentativas_login_' . Str::slug($email);
-
-        /**
-         * 🔐 Medida de segurança exigida pelo professor:
-         * Limitar tentativas de login para evitar ataques de força bruta.
-         * Se o utilizador errar a palavra-passe 4 vezes, o login é bloqueado por 15 minutos.
-         */
-        if (Cache::has($cacheKey . '_bloqueado')) {
-            return back()->with('erro', 'Conta temporariamente bloqueada. Tente novamente em 15 minutos.');
-        }
-
-        $utilizador = Utilizador::where('email', $email)->first();
-
-        if ($utilizador && Hash::check($request->palavra_passe, $utilizador->palavra_passe)) {
-            // ✅ Limpa tentativas ao fazer login com sucesso
-            Cache::forget($cacheKey);
-            Cache::forget($cacheKey . '_bloqueado');
-
-            Auth::login($utilizador);
-            // 🔐 Segurança exigida pelo professor:
-            // Ao fazer login, encerramos automaticamente outras sessões deste utilizador
-            // Isso impede múltiplos acessos simultâneos com a mesma conta
-            
-            $request->session()->regenerate();
-
-            return redirect()->route('emails.index');
-        }
-
-        // ⛔ Incrementa tentativas
-        $tentativas = Cache::increment($cacheKey);
-
-        // Define validade da cache na primeira tentativa
-        if ($tentativas === 1) {
-            Cache::put($cacheKey, 1, now()->addMinutes(15));
-        }
-
-        if ($tentativas >= 4) {
-            // 🔒 Bloqueia por 15 minutos após 4 tentativas falhadas
-            Cache::put($cacheKey . '_bloqueado', true, now()->addMinutes(15));
-            return back()->with('erro', 'Demasiadas tentativas. Conta bloqueada por 15 minutos.');
-        }
-
-        return back()->with('erro', 'Credenciais inválidas.');
-    }
-
-    public function register(Request $request)
+    // ✅ Registro de novo utilizador
+    public function registar(Request $request)
     {
         $request->validate([
             'nome' => 'required|string',
@@ -96,13 +33,77 @@ class AuthController extends Controller
             'tipo' => $tipo,
         ]);
 
-        Auth::login($utilizador);
-        return redirect()->route('emails.index');
+        return response()->json(['mensagem' => 'Conta criada com sucesso', 'utilizador' => $utilizador], 201);
     }
 
-    public function logout()
+    // ✅ Login: envia código MFA para o email
+    public function login(Request $request)
     {
-        Auth::logout();
-        return redirect()->route('auth.login');
+        $request->validate([
+            'email' => 'required|email',
+            'palavra_passe' => 'required|string',
+        ]);
+
+        $utilizador = Utilizador::where('email', $request->email)->first();
+
+        if (!$utilizador || !Hash::check($request->palavra_passe, $utilizador->palavra_passe)) {
+            return response()->json(['erro' => 'Credenciais inválidas'], 401);
+        }
+
+        // Gerar código MFA
+        $codigo = rand(100000, 999999);
+        $expira_em = Carbon::now()->addMinutes(5);
+
+        CodigoMFA::create([
+            'utilizador_id' => $utilizador->id,
+            'codigo' => $codigo,
+            'expira_em' => $expira_em,
+        ]);
+
+        // Enviar código por email
+        Mail::raw("Seu código de verificação é: $codigo (válido por 5 minutos)", function ($message) use ($utilizador) {
+            $message->to($utilizador->email)
+                    ->subject('Código MFA - InboxManager');
+        });
+
+        return response()->json(['mensagem' => 'Código MFA enviado para o email']);
+    }
+
+    // ✅ Verifica o código e retorna acesso
+    public function verificarCodigo(Request $request)
+    {
+        $request->validate([
+            'email' => 'required|email',
+            'codigo' => 'required|string',
+        ]);
+
+        $utilizador = Utilizador::where('email', $request->email)->first();
+
+        if (!$utilizador) {
+            return response()->json(['erro' => 'Utilizador não encontrado'], 404);
+        }
+
+        $codigo = CodigoMFA::where('utilizador_id', $utilizador->id)
+                    ->where('codigo', $request->codigo)
+                    ->where('expira_em', '>', Carbon::now())
+                    ->latest()
+                    ->first();
+
+        if (!$codigo) {
+            return response()->json(['erro' => 'Código inválido ou expirado'], 403);
+        }
+
+        // Apagar o código após uso
+        $codigo->delete();
+
+        // Gerar token de acesso (simples - para testes)
+        $token = Str::random(60);
+
+        return response()->json([
+            'mensagem' => 'Autenticação bem-sucedida',
+            'utilizador' => $utilizador,
+            'token_fake' => $token // Troque por Sanctum ou Passport no futuro
+        ]);
     }
 }
+
